@@ -11,7 +11,7 @@ import streamlit as st
 import pandas as pd
 
 from sourcing_engine import Keepa, Scorer
-from lead_finder import LeadFinder, KeepaRateLimitError
+from lead_finder import LeadFinder, KeepaRateLimitError, KeepaBadRequestError
 from lite_profile import build_lite_profile
 from auth import login_gate
 
@@ -215,6 +215,15 @@ if n_leads:
                  f"**Wait:** ~{wait} minute(s) for tokens to refill, then try again.\n\n"
                  f"_Tip: a 5-lead click needs ~30+ tokens, 20 leads needs ~125+. "
                  f"Your refill rate is the bottleneck — upgrade your Keepa plan if this is too slow._")
+        st.stop()
+    except KeepaBadRequestError as e:
+        progress.empty(); status.empty()
+        st.error(f"Keepa rejected the search filter.\n\n"
+                 f"**Details:** {str(e)[:400]}\n\n"
+                 f"This is a code bug, not your account. Please tell Christian.")
+        with st.expander("Debug — what was sent to Keepa"):
+            st.code(json.dumps(e.selection, indent=2) if e.selection else "(no selection)", language='json')
+            st.code(e.body or "(no body)", language='text')
         st.stop()
     except Exception as e:
         progress.empty(); status.empty()
