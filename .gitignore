@@ -1,0 +1,23 @@
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only generated artifacts (optional — comment back in if you want to ship the cache to the cloud)
+# keepa_cache/
+# profile/saved_leads.json
+
+# Sensitive — never commit
+data/joined.csv
+data/asins.txt
+profile/winner_table.csv
