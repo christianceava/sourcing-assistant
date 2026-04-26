@@ -4,17 +4,8 @@ Active lead finder.
 Translates the winner profile into Keepa Product Finder filters, queries
 Keepa for matching candidates, then scores each via the Scorer and returns
 the top N.
-
-Token cost (rough):
-  - 1 product-finder query  : ~5 tokens
-  - N candidate detail pulls: 3 tokens each
-For 5 leads we pull ~10 candidates  ≈ 35 tokens (~7 min on free 5/min plan)
-For 10 leads we pull ~20 candidates ≈ 65 tokens (~13 min)
-For 20 leads we pull ~40 candidates ≈125 tokens (~25 min)
-
-If the plan refill rate is higher (paid Keepa tier), it's much faster.
 """
-import json, gzip, urllib.request, urllib.parse, time
+import json, gzip, urllib.request, urllib.parse, urllib.error, time
 from pathlib import Path
 
 
@@ -22,7 +13,6 @@ KEEPA_QUERY_URL = "https://api.keepa.com/query"
 
 
 # Mapping: Keepa root-category-name -> rootCategory ID (US marketplace).
-# Curated list of the categories Christian's winners live in.
 ROOT_CAT_IDS_US = {
     'Health & Household':            3760901,
     'Grocery & Gourmet Food':        16310101,
@@ -43,6 +33,14 @@ ROOT_CAT_IDS_US = {
 }
 
 
+class KeepaRateLimitError(Exception):
+    """Raised when Keepa returns 429 Too Many Requests."""
+    def __init__(self, msg, refill_in=None, tokens_left=None):
+        super().__init__(msg)
+        self.refill_in = refill_in
+        self.tokens_left = tokens_left
+
+
 class LeadFinder:
     def __init__(self, keepa_client, profile, scorer, known_asins=None):
         self.keepa = keepa_client
@@ -53,83 +51,90 @@ class LeadFinder:
     # ---------- Filter construction ----------
 
     def _filters_from_profile(self, n_leads, category_id=None):
-        """Build a Keepa Product Finder selection JSON from the winner profile."""
         bands = self.profile.get('bands', {}) or {}
         sel = {
             'page': 0,
             'perPage': max(20, n_leads * 2),
-            # Sort by current sales rank ascending (best sellers first within filter)
             'sort': [['current_SALES', 'asc']],
         }
-
-        # BSR: tighten to the winner band but expand a bit to get enough results
         bsr_band = bands.get('avg90_bsr') or bands.get('current_bsr')
         if bsr_band:
             sel['current_SALES_gte'] = max(50, int(bsr_band.get('p10') or 1000))
             sel['current_SALES_lte'] = int((bsr_band.get('p90') or 200000) * 1.5)
-
-        # Sell price band — Keepa uses cents
         price_band = bands.get('sell_price')
         if price_band:
             sel['current_BUY_BOX_SHIPPING_gte'] = int(max(5, price_band.get('p10') or 10) * 100)
             sel['current_BUY_BOX_SHIPPING_lte'] = int((price_band.get('p90') or 100) * 100)
-
-        # Reviews: avoid brand-new listings (need some social proof)
         sel['current_COUNT_REVIEWS_gte'] = 50
-
-        # Rating: 4.0+ (Keepa rating is x10)
         sel['current_RATING_gte'] = 40
-
-        # Buy box must be available (not Amazon-locked is a softer filter we apply later)
-        sel['buyBoxIsAmazon'] = False  # exclude listings where Amazon dominates buy box
-
-        # Restrict to a category (if specified)
+        sel['buyBoxIsAmazon'] = False
         if category_id:
             sel['rootCategory'] = category_id
-
         return sel
 
     def _winning_categories(self):
-        """Return list of (cat_name, cat_id) for our top winner categories."""
-        prefs = self.profile.get('preferred_categories') or self.profile.get('preferred_brands_from_title') or {}
-        # If the full profile is loaded we'll have category names; if lite, return None to skip
         if not self.profile.get('preferred_categories'):
-            return [(None, None)]  # single pass, no category filter
+            return [(None, None)]
         out = []
         for name, count in self.profile['preferred_categories'].items():
             cat_id = ROOT_CAT_IDS_US.get(name)
-            if cat_id and count >= 2:  # only solid winning cats
+            if cat_id and count >= 2:
                 out.append((name, cat_id))
-        if not out: out = [(None, None)]
-        return out
+        return out or [(None, None)]
 
     # ---------- Querying ----------
 
-    def query_keepa_finder(self, selection):
-        """Hit /query with the selection JSON. Returns asinList."""
+    def query_keepa_finder(self, selection, retries=2):
+        """Hit /query with the selection JSON. Returns asinList.
+           Retries once on 429, then raises KeepaRateLimitError."""
         sel_str = urllib.parse.quote(json.dumps(selection))
         url = f"{KEEPA_QUERY_URL}?key={self.keepa.key}&domain=1&selection={sel_str}"
-        req = urllib.request.Request(url, headers={'Accept-Encoding': 'gzip'})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = r.read()
-            if r.headers.get('Content-Encoding') == 'gzip':
-                data = gzip.decompress(data)
-            return json.loads(data.decode('utf-8'))
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request(url, headers={'Accept-Encoding': 'gzip'})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    data = r.read()
+                    if r.headers.get('Content-Encoding') == 'gzip':
+                        data = gzip.decompress(data)
+                    return json.loads(data.decode('utf-8'))
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code == 429:
+                    # Check token state & wait briefly
+                    try:
+                        tok = self.keepa.tokens()
+                        refill = tok.get('refillIn', 60000) / 1000.0  # ms -> s
+                        left = tok.get('tokensLeft', 0)
+                    except Exception:
+                        refill, left = 60, 0
+                    if attempt < retries:
+                        time.sleep(min(refill + 2, 30))
+                        continue
+                    raise KeepaRateLimitError(
+                        f"Keepa rate-limited (429). Tokens left: {left}. "
+                        f"Refilling in {int(refill)}s.",
+                        refill_in=refill, tokens_left=left)
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                raise
+        if last_err: raise last_err
 
     # ---------- Main: source N leads ----------
 
     def source(self, n_leads, on_progress=None):
-        """Return up to n_leads scored candidates as a list of dicts.
-           on_progress(stage, pct, msg) called for UI updates."""
         results = []
         seen = set()
         cats = self._winning_categories()
 
-        # How many candidates to consider total
         target_candidates = max(n_leads * 3, 15)
         per_cat = max(8, target_candidates // max(len(cats), 1))
 
-        if on_progress: on_progress('search', 0, f'Querying Keepa across {len(cats)} winning category(ies)...')
+        if on_progress: on_progress('search', 0, f'Querying Keepa across {len(cats)} category bucket(s)...')
 
         all_asins = []
         for i, (cat_name, cat_id) in enumerate(cats):
@@ -137,8 +142,11 @@ class LeadFinder:
             sel['perPage'] = per_cat
             try:
                 data = self.query_keepa_finder(sel)
+            except KeepaRateLimitError as e:
+                # Bubble up cleanly so the UI can tell the user
+                raise
             except Exception as e:
-                if on_progress: on_progress('search', (i+1)/len(cats), f"Search error in {cat_name}: {e}")
+                if on_progress: on_progress('search', (i+1)/len(cats), f"Search error in {cat_name or 'all cats'}: {e}")
                 continue
             asins = data.get('asinList') or []
             new_asins = [a for a in asins if a not in self.known and a not in seen]
@@ -149,21 +157,20 @@ class LeadFinder:
                             f"Got {len(asins)} from {cat_name or 'all cats'} ({len(new_asins)} new)")
             if len(all_asins) >= target_candidates: break
 
-        # Trim to target
         candidates = all_asins[:target_candidates]
         if not candidates:
             return []
 
         if on_progress: on_progress('score', 0, f'Pulling Keepa details for {len(candidates)} candidates...')
 
-        # Pull product details (batched)
         try:
             products = self.keepa.product(candidates)
-        except Exception as e:
-            if on_progress: on_progress('score', 0, f"Keepa product error: {e}")
-            return []
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise KeepaRateLimitError(
+                    "Keepa rate-limited fetching product details. Try again in ~1 min.")
+            raise
 
-        # Score
         for i, asin in enumerate(candidates):
             kd = products.get(asin)
             if not kd: continue
@@ -188,6 +195,5 @@ class LeadFinder:
             if on_progress:
                 on_progress('score', (i+1)/len(candidates), f"Scored {asin}: {score}")
 
-        # Top N by score
         results.sort(key=lambda r: -r['score'])
         return results[:n_leads]

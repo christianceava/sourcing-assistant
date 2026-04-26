@@ -2,13 +2,7 @@
 Sourcing Assistant — ONLINE web app.
 
 Single-button UX:  pick 5 / 10 / 20 → Source → ranked list of leads matching
-the winner signature. Every lead is a NEW ASIN we don't already sell.
-
-Deploy on Streamlit Cloud:
-  1. Push this folder to GitHub
-  2. Connect on streamlit.io/cloud
-  3. Set main file: app/sourcing_app.py
-  4. Add secret: keepa_key = "..."
+the winner signature.
 """
 import json, time, csv, io, os
 from pathlib import Path
@@ -17,7 +11,7 @@ import streamlit as st
 import pandas as pd
 
 from sourcing_engine import Keepa, Scorer
-from lead_finder import LeadFinder
+from lead_finder import LeadFinder, KeepaRateLimitError
 from lite_profile import build_lite_profile
 from auth import login_gate
 
@@ -35,7 +29,7 @@ KEEPA_KEY = (st.secrets.get('keepa_key', None) if hasattr(st, 'secrets') else No
     or "4ar1u0a82tjo3pscefaae54qghvab4jnoc0ci3gfj2u53vuoh9593i0102uajpm1"
 
 st.set_page_config(page_title="Sourcing Assistant", page_icon="🎯", layout="wide",
-                   initial_sidebar_state="collapsed")
+                   initial_sidebar_state="expanded")
 
 # ---------- Auth gate ----------
 login_gate()
@@ -44,31 +38,26 @@ login_gate()
 st.markdown("""
 <style>
 .block-container { padding-top: 2rem; padding-bottom: 4rem; max-width: 1280px; }
-.big-cta {
-  background: linear-gradient(135deg, #0f1115 0%, #1a1f2a 100%);
-  border-radius: 18px; padding: 36px 28px; margin: 24px 0;
-  border: 1px solid #2a2f3a;
-}
-.lead-card {
-  background: #181c23; border: 1px solid #262b34;
-  border-radius: 12px; padding: 18px 20px; margin-bottom: 12px;
-}
+.lead-card { background: #181c23; border: 1px solid #262b34; border-radius: 12px; padding: 18px 20px; margin-bottom: 12px; }
 .lead-title { font-size: 1.05rem; font-weight: 600; color: #fff; line-height: 1.4; }
 .lead-meta { color: #9ba3b1; font-size: 0.85rem; margin-top: 4px; }
-.kpi { display:inline-block; background: #11141a; border:1px solid #262b34;
-       border-radius: 6px; padding: 4px 10px; margin-right: 6px; font-size: 0.82rem; color:#cbd1dc; }
+.kpi { display:inline-block; background: #11141a; border:1px solid #262b34; border-radius: 6px; padding: 4px 10px; margin-right: 6px; font-size: 0.82rem; color:#cbd1dc; }
 .verdict-buy   { background:#0d8a3e; color:#fff; padding:4px 12px; border-radius:6px; font-weight:600; font-size:.9rem;}
 .verdict-maybe { background:#b8860b; color:#fff; padding:4px 12px; border-radius:6px; font-weight:600; font-size:.9rem;}
 .verdict-skip  { background:#9c2222; color:#fff; padding:4px 12px; border-radius:6px; font-weight:600; font-size:.9rem;}
 .score-badge   { background:#2563eb; color:#fff; padding:4px 12px; border-radius:6px; font-weight:700; }
 .criterion-row { padding:8px 12px; border-radius:6px; margin-bottom:4px; background:#11141a; font-size:.85rem; }
 .warn-flag { color: #f59e0b; font-size: 0.85rem; }
+.token-pill {
+  display:inline-block; padding:6px 14px; border-radius:8px; font-size:.85rem;
+  background:#11141a; border:1px solid #262b34; color:#cbd1dc; margin-bottom:6px;
+}
+.token-low { color:#f59e0b; border-color:#f59e0b; }
+.token-empty { color:#ef4444; border-color:#ef4444; }
 hr { border-color: #262b34; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ---------- Cached resources ----------
 
 @st.cache_resource
 def get_keepa():
@@ -77,7 +66,6 @@ def get_keepa():
 
 @st.cache_resource
 def get_profile():
-    """Load full profile if available, else build/load lite profile from joined.csv."""
     if PROFILE_FULL.exists():
         return json.loads(PROFILE_FULL.read_text())
     if PROFILE_LITE.exists():
@@ -122,10 +110,37 @@ profile = get_profile()
 keepa = get_keepa()
 
 if not profile:
-    st.error("No winner profile found. Place `joined.csv` in `data/` and reload.")
+    st.error("No winner profile found.")
     st.stop()
 
-# ---------- Compact profile summary ----------
+# ---------- Live Keepa token status ----------
+
+@st.cache_data(ttl=20)  # refresh every 20 sec
+def fetch_tokens():
+    try:
+        return keepa.tokens()
+    except Exception as e:
+        return {'error': str(e)}
+
+tok = fetch_tokens()
+if 'error' in tok:
+    st.warning(f"Keepa connectivity issue: {tok['error']}")
+else:
+    left = tok.get('tokensLeft', 0)
+    rate = tok.get('refillRate', 5)
+    refill_secs = (tok.get('refillIn') or 0) / 1000.0
+    cls = 'token-empty' if left < 30 else ('token-low' if left < 100 else '')
+    st.markdown(
+        f"<span class='token-pill {cls}'>Keepa tokens: <b>{left}</b> "
+        f"&nbsp;·&nbsp; refill: {int(rate)}/min "
+        f"&nbsp;·&nbsp; next refill in {int(refill_secs)}s</span>",
+        unsafe_allow_html=True)
+    if left < 30:
+        st.warning(
+            f"⚠️ Only {left} Keepa tokens left. A 5-lead query needs ~30+ tokens. "
+            f"Wait ~{max(1, int((35-left)/max(rate,1)))} min for refill, or upgrade your Keepa plan.")
+
+# Profile summary
 ws = profile.get('generated_from_n_winners', 0)
 mode = profile.get('mode', 'full')
 top_vendors = list(profile.get('preferred_vendors', {}).items())[:5]
@@ -138,37 +153,38 @@ c2.metric("Trained on # winners", ws)
 if bsr_band: c3.metric("Winner BSR (median)", f"{int(bsr_band['median']):,}")
 if price_band: c4.metric("Winner price (median)", f"${price_band['median']:.2f}")
 
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    strictness = st.slider("Match strictness", 0.0, 1.0, 0.55, 0.05,
+                           help="0 = wider net (more results, less precise). 1 = only near-clones.")
+    user = st.session_state.get('user_email', '')
+    if user: st.caption(f"Signed in: {user}")
+    if st.button("Sign out"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+    st.divider()
+    st.markdown("### 🏆 Top winning vendors")
+    if top_vendors:
+        for v, c in top_vendors:
+            st.markdown(f"- {v}  <span class='kpi'>{c}</span>", unsafe_allow_html=True)
+    else:
+        st.caption("(profile is in lite mode — vendor list not loaded)")
+    st.divider()
+    st.caption("The assistant has internalized your 365-day sales history. It uses BSR/price/ROI patterns silently to filter Keepa for matching candidates.")
+
 # ---------- Big CTA ----------
 
-st.markdown('<div class="big-cta">', unsafe_allow_html=True)
 st.markdown("### 🚀 Source new leads")
-st.markdown("Click below — I'll find Amazon products matching your winner signature, score each, and return the strongest ones.")
+st.markdown("Click below — I'll find Amazon products matching your winner signature, score each, and return the strongest.")
 
 cca, ccb, ccc, ccd = st.columns([1,1,1,3])
 n_leads = None
 if cca.button("⚡ 5 leads", type="primary", use_container_width=True): n_leads = 5
 if ccb.button("🔥 10 leads", type="primary", use_container_width=True): n_leads = 10
 if ccc.button("💪 20 leads", type="primary", use_container_width=True): n_leads = 20
-
-with st.sidebar:
-    st.markdown("### Settings")
-    strictness = st.slider("Match strictness", 0.0, 1.0, 0.55, 0.05,
-                           help="0 = wider net (more results, less precise). 1 = only near-clones of past winners.")
-    if st.button("Check Keepa tokens"):
-        try:
-            t = keepa.tokens()
-            st.write(f"**{t.get('tokensLeft')}** tokens, refilling **{t.get('refillRate')}/min**")
-        except Exception as e:
-            st.error(str(e))
-    st.divider()
-    st.markdown("### Top winning vendors")
-    for v, c in top_vendors:
-        st.markdown(f"- {v}  &nbsp; <span class='kpi'>{c}</span>", unsafe_allow_html=True)
-    st.divider()
-    st.markdown("### About this profile")
-    st.caption("The assistant has internalized your 365-day sold history — what BSR, price, and vendor patterns predict winners. It's used silently to filter Keepa for matching candidates.")
-
-st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------- Run sourcing ----------
 
@@ -181,29 +197,42 @@ if n_leads:
     status = st.empty()
 
     def on_progress(stage, pct, msg):
-        # Stage weights: search 30%, score 70%
         if stage == 'search':
-            progress.progress(min(0.3 * pct, 0.3), text=f"🔍 Searching Keepa: {msg}")
+            progress.progress(min(0.3 * pct, 0.3), text=f"🔍 Searching: {msg}")
         else:
             progress.progress(0.3 + 0.7 * pct, text=f"🧮 Scoring: {msg}")
         status.caption(msg)
 
     t0 = time.time()
+    leads = []
     try:
         leads = finder.source(n_leads, on_progress=on_progress)
+    except KeepaRateLimitError as e:
+        progress.empty(); status.empty()
+        wait = max(1, int((e.refill_in or 60) / 60))
+        st.error(f"⏳ Keepa rate-limited.\n\n"
+                 f"**Tokens left:** {e.tokens_left if e.tokens_left is not None else '?'}  \n"
+                 f"**Wait:** ~{wait} minute(s) for tokens to refill, then try again.\n\n"
+                 f"_Tip: a 5-lead click needs ~30+ tokens, 20 leads needs ~125+. "
+                 f"Your refill rate is the bottleneck — upgrade your Keepa plan if this is too slow._")
+        st.stop()
     except Exception as e:
+        progress.empty(); status.empty()
         st.error(f"Sourcing failed: {e}")
         st.stop()
     progress.progress(1.0, text="Done.")
     elapsed = time.time() - t0
 
     if not leads:
-        st.warning("No matching candidates returned. Try a lower strictness, or check token balance.")
+        st.warning(
+            "No matching candidates returned. This usually means:\n\n"
+            "- **Keepa rate-limit** (most common) — wait ~1 minute and try again.\n"
+            "- **Strictness too high** — try the slider in the sidebar set to 0.3-0.4.\n"
+            "- **Bands too narrow** — your winner profile may need more diverse training data.")
         st.stop()
 
     st.success(f"Found {len(leads)} leads in {elapsed:.1f}s")
 
-    # Summary tally
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Returned", len(leads))
     s2.metric("✅ BUY", sum(1 for l in leads if l['verdict'] == 'BUY'))
@@ -213,7 +242,6 @@ if n_leads:
     st.divider()
     st.markdown(f"### Top {len(leads)} leads")
 
-    # Render lead cards
     for lead in leads:
         with st.container():
             st.markdown('<div class="lead-card">', unsafe_allow_html=True)
@@ -225,7 +253,6 @@ if n_leads:
                 if lead.get('category'): meta.append(lead['category'])
                 meta.append(lead['asin'])
                 st.markdown(f"<div class='lead-meta'>{' · '.join(meta)}</div>", unsafe_allow_html=True)
-                # KPI row
                 kpis = []
                 if lead.get('sell_price'): kpis.append(f"${lead['sell_price']:.2f}")
                 if lead.get('bsr_90d'): kpis.append(f"BSR {int(lead['bsr_90d']):,}")
@@ -234,7 +261,6 @@ if n_leads:
                 if lead.get('live_offers') is not None: kpis.append(f"{lead['live_offers']} FBA")
                 if lead.get('est_monthly_sales'): kpis.append(f"~{lead['est_monthly_sales']:,}/mo")
                 st.markdown(' '.join(f"<span class='kpi'>{k}</span>" for k in kpis), unsafe_allow_html=True)
-                # Risk flags
                 flags = []
                 if lead.get('hazmat'): flags.append('hazmat')
                 if lead.get('oversize'): flags.append('oversize')
@@ -270,7 +296,6 @@ if n_leads:
                     save_leads(saved); st.success("Saved.")
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # Download CSV
     df = pd.DataFrame([{k: v for k, v in l.items() if k != 'criteria'} for l in leads])
     st.download_button(
         "⬇ Download leads as CSV",
